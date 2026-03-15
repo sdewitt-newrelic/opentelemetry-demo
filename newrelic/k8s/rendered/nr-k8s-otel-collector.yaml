@@ -26,7 +26,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/name: nr-k8s-otel-collector
     app.kubernetes.io/version: 1.2.0
-    helm.sh/chart: nr-k8s-otel-collector-0.10.0
+    helm.sh/chart: nr-k8s-otel-collector-0.10.13
   annotations:
 ---
 # Source: nr-k8s-otel-collector/templates/daemonset-configmap.yaml
@@ -40,7 +40,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/name: nr-k8s-otel-collector
     app.kubernetes.io/version: 1.2.0
-    helm.sh/chart: nr-k8s-otel-collector-0.10.0
+    helm.sh/chart: nr-k8s-otel-collector-0.10.13
 data:
   daemonset-config.yaml: |
     receivers:
@@ -73,6 +73,12 @@ data:
             metrics:
               system.filesystem.utilization:
                 enabled: true
+            # Exclude container storage overlay mount to avoid permission errors when running as non-root
+            # This is only relevant for CRI-O container runtime (used by OKE, OpenShift, etc.)
+            exclude_mount_points:
+              mount_points:
+                - ^/var/lib/containers/storage/overlay$
+              match_type: regexp
           disk:
             metrics:
               system.disk.merged:
@@ -85,18 +91,6 @@ data:
             metrics:
               system.network.connections:
                 enabled: false
-          # Uncomment to enable process metrics, which can be noisy but valuable.
-          # processes:
-          # process:
-          #   metrics:
-          #     process.cpu.utilization:
-          #       enabled: true
-          #     process.cpu.time:
-          #       enabled: false
-          #   mute_process_name_error: true
-          #   mute_process_exe_error: true
-          #   mute_process_io_error: true
-          #   mute_process_user_error: true
 
       kubeletstats:
         collection_interval: 1m
@@ -137,6 +131,31 @@ data:
                 - source_labels: [__meta_kubernetes_node_name]
                   regex: ${KUBE_NODE_NAME}
                   action: keep
+              metric_relabel_configs:
+                # Init temporary label is_network_metric for all metrics
+                - source_labels: [__name__]
+                  regex: '.*'
+                  target_label: "is_network_metric"
+                  replacement: "false"
+                - source_labels: [__name__]
+                  regex: '^container_network_.*'
+                  target_label: "is_network_metric"
+                  replacement: "true"
+
+                # Drop metrics without container/image/name for non-network metrics
+                - source_labels: [is_network_metric, container]
+                  regex: '^false;$'
+                  action: drop
+                - source_labels: [is_network_metric, image]
+                  regex: '^false;$'
+                  action: drop
+                - source_labels: [is_network_metric, name]
+                  regex: '^false;$'
+                  action: drop
+
+                # Remove temporary label
+                - regex: 'is_network_metric'
+                  action: labeldrop
               scheme: https
               tls_config:
                 ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
@@ -430,6 +449,8 @@ data:
 
       metricstransform/hostmetrics:
         transforms:
+          # When ATP is disabled: Only include a limited subset of process metrics.
+          # This matches the original behavior before ATP was introduced.
           - include: process\.(cpu\.utilization|disk\.io|memory\.(usage|virtual))
             action: update
             match_type: regexp
@@ -544,25 +565,6 @@ data:
                 aggregation_type: sum
 
       # following system.% metrics reduce metrics reported by hostmetrics receiver
-      filter/exclude_cpu_utilization:
-        metrics:
-          datapoint:
-            - 'metric.name == "system.cpu.utilization" and attributes["state"] == "interrupt"'
-            - 'metric.name == "system.cpu.utilization" and attributes["state"] == "nice"'
-            - 'metric.name == "system.cpu.utilization" and attributes["state"] == "softirq"'
-      filter/exclude_memory_utilization:
-        metrics:
-          datapoint:
-            - 'metric.name == "system.memory.utilization" and attributes["state"] == "slab_unreclaimable"'
-            - 'metric.name == "system.memory.utilization" and attributes["state"] == "inactive"'
-            - 'metric.name == "system.memory.utilization" and attributes["state"] == "cached"'
-            - 'metric.name == "system.memory.utilization" and attributes["state"] == "buffered"'
-            - 'metric.name == "system.memory.utilization" and attributes["state"] == "slab_reclaimable"'
-      filter/exclude_memory_usage:
-        metrics:
-          datapoint:
-            - 'metric.name == "system.memory.usage" and attributes["state"] == "slab_unreclaimable"'
-            - 'metric.name == "system.memory.usage" and attributes["state"] == "inactive"'
       filter/exclude_filesystem_utilization:
         metrics:
           datapoint:
@@ -626,6 +628,8 @@ data:
         detectors: [gcp, eks, ec2, aks, azure, oraclecloud]
         timeout: 2s
         override: false
+        eks:
+          node_from_env_var: KUBE_NODE_NAME
 
       resource/newrelic:
         attributes:
@@ -635,7 +639,7 @@ data:
             value: opentelemetry-demo
           - key: "newrelic.chart.version"
             action: upsert
-            value: 0.10.0
+            value: 0.10.13
           - key: newrelic.entity.type
             action: upsert
             value: "k8s"
@@ -764,6 +768,12 @@ data:
             condition: instrumentation_scope.name == "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/pagingscraper"
             pipelines: [metrics/nr]
           - context: metric
+            condition: instrumentation_scope.name == "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processscraper"
+            pipelines: [metrics/nr]
+          - context: metric
+            condition: instrumentation_scope.name == "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processesscraper"
+            pipelines: [metrics/nr]
+          - context: metric
             condition: instrumentation_scope.name == "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusreceiver"
             pipelines: [metrics/nr_prometheus_cadv_kubelet]
           - context: metric
@@ -803,9 +813,6 @@ data:
             - filter/exclude_metrics_low_data_mode
             - metricstransform/hostmetrics_cpu
             - transform/truncate
-            - filter/exclude_cpu_utilization
-            - filter/exclude_memory_utilization
-            - filter/exclude_memory_usage
             - filter/exclude_filesystem_utilization
             - filter/exclude_filesystem_usage
             - filter/exclude_filesystem_inodes_usage
@@ -905,7 +912,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/name: nr-k8s-otel-collector
     app.kubernetes.io/version: 1.2.0
-    helm.sh/chart: nr-k8s-otel-collector-0.10.0
+    helm.sh/chart: nr-k8s-otel-collector-0.10.13
 data:
   deployment-config.yaml: |
     receivers:
@@ -1385,23 +1392,16 @@ data:
       filter/nr_exclude_zero_value_kube_pod_container_deployment_statuses:
         metrics:
           datapoint:
-            - metric.name == "kube_pod_status_phase" and value_double < 0.5
-            - metric.name == "kube_pod_status_ready" and value_double < 0.5
-            - metric.name == "kube_pod_status_scheduled" and value_double < 0.5
-            - metric.name == "kube_pod_container_status_ready" and value_double < 0.5
-            - metric.name == "kube_pod_container_status_phase" and value_double < 0.5
-            - metric.name == "kube_pod_container_status_restarts_total" and value_double < 0.5
-            - metric.name == "kube_deployment_status_condition" and value_double < 0.5
-            - metric.name == "kube_pod_container_status_waiting_reason" and value_double < 0.5
+            - metric.name == "kube_pod_status_phase" and value_double == 0.0
+            - metric.name == "kube_pod_status_ready" and value_double == 0.0
+            - metric.name == "kube_pod_status_scheduled" and value_double == 0.0
+            - metric.name == "kube_pod_container_status_phase" and value_double == 0.0
+            - metric.name == "kube_deployment_status_condition" and value_double == 0.0
 
       filter/nr_exclude_zero_value_kube_jobs:
         metrics:
           datapoint:
-            - metric.name == "kube_job_complete" and value_double < 0.5
-            - metric.name == "kube_job_spec_parallelism" and value_double < 0.5
-            - metric.name == "kube_job_status_failed" and value_double < 0.5
-            - metric.name == "kube_job_status_active" and value_double < 0.5
-            - metric.name == "kube_job_status_succeeded" and value_double < 0.5
+            - metric.name == "kube_job_complete" and value_double == 0.0
 
       resource/newrelic:
         attributes:
@@ -1411,7 +1411,7 @@ data:
             value: opentelemetry-demo
           - key: "newrelic.chart.version"
             action: upsert
-            value: 0.10.0
+            value: 0.10.13
           - key: newrelic.entity.type
             action: upsert
             value: "k8s"
@@ -1429,7 +1429,7 @@ data:
             value: opentelemetry-demo
           - key: "newrelic.chart.version"
             action: upsert
-            value: 0.10.0
+            value: 0.10.13
 
       transform/events:
         log_statements:
@@ -1902,7 +1902,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/name: nr-k8s-otel-collector
     app.kubernetes.io/version: 1.2.0
-    helm.sh/chart: nr-k8s-otel-collector-0.10.0
+    helm.sh/chart: nr-k8s-otel-collector-0.10.13
 rules:
   - apiGroups:
     - ""
@@ -2007,7 +2007,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/name: nr-k8s-otel-collector
     app.kubernetes.io/version: 1.2.0
-    helm.sh/chart: nr-k8s-otel-collector-0.10.0
+    helm.sh/chart: nr-k8s-otel-collector-0.10.13
 subjects:
   - kind: ServiceAccount
     name: nr-k8s-otel-collector
@@ -2055,7 +2055,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/name: nr-k8s-otel-collector
     app.kubernetes.io/version: 1.2.0
-    helm.sh/chart: nr-k8s-otel-collector-0.10.0
+    helm.sh/chart: nr-k8s-otel-collector-0.10.13
 spec:
   type: ClusterIP
   ports:
@@ -2084,7 +2084,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/name: nr-k8s-otel-collector
     app.kubernetes.io/version: 1.2.0
-    helm.sh/chart: nr-k8s-otel-collector-0.10.0
+    helm.sh/chart: nr-k8s-otel-collector-0.10.13
 spec:
   selector:
     matchLabels:
@@ -2098,7 +2098,7 @@ spec:
         app.kubernetes.io/name: nr-k8s-otel-collector
         component: daemonset
       annotations:
-        checksum/config: 2b30748172ebc1d25c34cde7dd6c3436120e74028d504248a682ba0b3fc0a9eb
+        checksum/config: c3484efca1875e4181ab7e86ec05ee88df316f426ce2bab26a917eba632280bf
     spec:
       serviceAccountName: nr-k8s-otel-collector
       initContainers:
@@ -2125,7 +2125,13 @@ spec:
                 export NODE_CPU_ALLOCATABLE=$(awk "BEGIN {print ${NODE_CPU_ALLOCATABLE%?} / 1000}")
               fi
 
-              export NODE_MEMORY_ALLOCATABLE=$(kubectl get node $NODE_NAME -o jsonpath='{.status.allocatable.memory}' | numfmt --from=auto)
+              export NODE_MEMORY_ALLOCATABLE=$(kubectl get node $NODE_NAME -o jsonpath='{.status.allocatable.memory}' | awk '
+                /Ki$/ {printf "%.0f\n", $1 * 1024; next}
+                /Mi$/ {printf "%.0f\n", $1 * 1024^2; next}
+                /Gi$/ {printf "%.0f\n", $1 * 1024^3; next}
+                /m$/  {printf "%.0f\n", $1 / 1000; next}
+                {print $1}
+              ')
 
               if [[ -z "NODE_MEMORY_ALLOCATABLE" ]] || [[ "NODE_MEMORY_ALLOCATABLE" == "0" ]]; then
                 echo "Could not retrieve Memory allocatable for node $NODE_NAME"
@@ -2168,7 +2174,7 @@ spec:
             - --config
             - /config/daemonset-config.yaml
             - --feature-gates
-            - metricsgeneration.MatchAttributes
+            - metricsgeneration.MatchAttributes,-processor.resourcedetection.propagateerrors
           resources:
             {}
           env:
@@ -2317,7 +2323,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/name: nr-k8s-otel-collector
     app.kubernetes.io/version: 1.2.0
-    helm.sh/chart: nr-k8s-otel-collector-0.10.0
+    helm.sh/chart: nr-k8s-otel-collector-0.10.13
 spec:
   replicas: 1
   minReadySeconds: 5
@@ -2333,7 +2339,7 @@ spec:
         app.kubernetes.io/name: nr-k8s-otel-collector
         component: deployment
       annotations:
-        checksum/config: a0d06691977232bc8023b721d7ca97feb36408f8447b2b57fac3eb13881631ef
+        checksum/config: 9bd953b18a7e628ad77a9bd56f3596089eb5dff0d3e94601ad737893bc4ad330
     spec:
       serviceAccountName: nr-k8s-otel-collector
       containers:
